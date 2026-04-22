@@ -1,0 +1,15 @@
+{
+  "name": "matrix-skill",
+  "owner": {
+    "name": "Minagawa",
+    "email": "office@minagawa.de"
+  },
+  "plugins": [
+    {
+      "name": "matrix-expert",
+      "source": "./",
+      "description": "Expert guidance on Matrix protocol, matrix-rust-sdk, E2EE, MAS OAuth, sliding sync, and bot/client architecture.",
+      "version": "0.1.0"
+    }
+  ]
+}

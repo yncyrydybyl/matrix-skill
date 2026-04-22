@@ -1,0 +1,21 @@
+{
+  "name": "matrix-expert",
+  "version": "0.1.0",
+  "description": "Expert guidance on Matrix protocol, matrix-rust-sdk, E2EE, MAS OAuth, sliding sync, and bot/client architecture.",
+  "author": {
+    "name": "Minagawa",
+    "email": "office@minagawa.de"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/yncyrydybyl/matrix-skill",
+  "repository": "https://github.com/yncyrydybyl/matrix-skill",
+  "keywords": [
+    "matrix",
+    "matrix-rust-sdk",
+    "e2ee",
+    "oauth",
+    "mas",
+    "sliding-sync",
+    "element"
+  ]
+}
