@@ -10,8 +10,6 @@ allowed-tools:
   - Grep
   - Glob
   - Bash
-  - Edit
-  - Write
   - WebFetch
 ---
 
@@ -19,6 +17,9 @@ allowed-tools:
 
 Deep knowledge of the Matrix ecosystem: protocol, matrix-rust-sdk, MAS OAuth, E2EE, sliding
 sync, and the architectural patterns that make or break real-world apps.
+
+> **Currency**: knowledge current as of 2026-04. `matrix-rust-sdk` API evolves quickly —
+> verify specific symbol names against the current docs for newer SDK versions.
 
 ## When to use
 
@@ -61,9 +62,10 @@ Rules:
 
 - `Client::builder().handle_refresh_tokens()` → SDK auto-refreshes on 401. Without it, you
   must call `client.refresh_access_token()` yourself.
-- `SessionTokens { access_token, refresh_token }` passed to `restore_session()`. If
-  `refresh_token` is `None`, auto-refresh is disabled for that session even if the builder
-  enabled it.
+- `restore_session()` takes a `MatrixSession` that wraps `SessionTokens { access_token,
+  refresh_token }` plus identity fields (`user_id`, `device_id`). `refresh_token` is
+  `Option<String>` — if `None`, auto-refresh is disabled for that session even if the
+  builder enabled it.
 - `Client::set_session_callbacks(reload_cb, save_cb)` — `save_cb` fires after refresh so you
   can persist new tokens to disk. `reload_cb` is **only used for OAuth cross-process mode**,
   NOT for matrix-auth refresh. So you can't rely on it to re-read disk before refresh in the
@@ -82,10 +84,21 @@ Rules:
   `m.room.create`, `m.room.canonical_alias`) — otherwise `Room::name()` returns None and
   `display_name()` falls back to member names.
 - `no_timeline_limit()` = don't fetch any timeline events (fast, good for room list only).
-- Server must advertise support: look for `"simplified_msc3575"` or equivalent in
-  `.well-known` unstable features. MAS-fronted servers (Synapse MAS, Conduit) support it.
+- Server must advertise support: look for `"org.matrix.simplified_msc3575"` in
+  `/_matrix/client/versions` → `unstable_features`. MAS-fronted servers (Synapse MAS,
+  Conduit) support it.
 - Sliding sync is the right choice for **initial state** / room list on large accounts. For
   live sync, either sliding sync or traditional works — traditional is simpler.
+
+### `RoomListService` — the high-level API
+
+`matrix_sdk_ui::room_list_service::RoomListService` is the recommended high-level API built
+on top of sliding sync. It handles list lifecycle, state hydration, filters, and
+room-subscription windowing for you. Use it for anything UI-shaped: room lists, dashboards,
+chat clients. Drop to raw `SlidingSync` (skeleton at the bottom of this doc) only when you
+need custom list windows, bespoke `required_state`, or non-UI patterns. Paired with
+`RoomListService`, the `EncryptionSyncService` (also in `matrix_sdk_ui`) runs a dedicated
+sync loop for to-device messages, key requests, and backup — see the E2EE section below.
 
 ### E2EE: what breaks, how to fix
 
@@ -99,13 +112,22 @@ Rules:
   1. Enable key backup: `EncryptionSettings { auto_enable_backups: true, ... }`
   2. Enter recovery key → pulls signing + backup keys from server
   3. Request keys from other devices (manual verification)
-- **`backup_download_strategy: AfterDecryptionFailure`** = lazy backup fetch (downloads a key
-  only when you try to decrypt a message and fail). Alternative is `OneShot` which downloads
-  everything at startup — slow on large accounts.
+- **`backup_download_strategy: BackupDownloadStrategy::AfterDecryptionFailure`** = lazy
+  backup fetch (downloads a key only when you try to decrypt a message and fail).
+  Alternative is `BackupDownloadStrategy::OneShot` which downloads everything at startup —
+  slow on large accounts.
 - **`auto_enable_cross_signing: true`** + `auto_enable_backups: true` in `EncryptionSettings`
   makes new logins automatically bootstrap cross-signing and turn on key backup.
+- **`EncryptionSyncService`** (`matrix_sdk_ui`) runs a dedicated sync loop for to-device
+  messages, key requests, and backup — independent of your main `client.sync()`. Bots that
+  only run `client.sync()` sometimes miss room keys; running the encryption sync service
+  alongside fixes it. Element uses it by default via the RoomListService integration.
 - **Crypto store = SQLite file** (`matrix-sdk-state.sqlite3` etc). One writer at a time.
   Sharing between processes will corrupt it. Separate processes need separate stores.
+- **Separate state/crypto store from event cache.** Modern SDKs expose
+  `sqlite_store_with_cache_path(state_path, cache_path, passphrase)` so the volatile event
+  cache can live on fast or tmpfs storage while durable state + crypto stay on persistent
+  storage. Recommended for large accounts.
 - **Crypto store corruption** on SDK upgrade: error looks like
   `"Failed to deserialize RoomInfo"` or `"could not deserialize ... sqlite"`. Only fix is
   wipe + re-sync. **Always back up the store before wiping** — it contains your private keys.
@@ -163,30 +185,30 @@ cross-signed, and Element will trust it.
 
 ## Architectural Rules (learned the hard way)
 
-1. **One Matrix `Client` per process.** Always. The TUI, the bot, the background indexer
-   — all share ONE client. `Client` is Arc-internally, clone is free.
+1. **One Matrix `Client` per process, and prefer one process.** `Client` is
+   `Arc<ClientInner>` internally — clone is free, pass it around. The TUI, the bot, the
+   background indexer all share ONE client. Separate processes mean separate crypto
+   stores, separate refresh locks, separate bugs; spawn tasks on the shared client instead.
 
-2. **Prefer `spawn_tasks_on_shared_client` over `spawn_process_with_own_client`**. Separate
-   processes mean separate crypto stores, separate refresh locks, separate bugs.
-
-3. **Token persistence: disk is truth, memory is cache.** Before any refresh, reload from
+2. **Token persistence: disk is truth, memory is cache.** Before any refresh, reload from
    disk. After any refresh, atomic write to disk.
 
-4. **Don't trust `sync_once()` on large accounts.** Always use sliding sync for the initial
-   population.
+3. **Don't trust `sync_once()` on large accounts.** Always use sliding sync (or
+   `RoomListService`) for the initial population.
 
-5. **Provide a clear re-auth path.** When a refresh token is truly revoked, the user must
+4. **Provide a clear re-auth path.** When a refresh token is truly revoked, the user must
    be able to run OAuth again without wiping the crypto store. The crypto store survives
    token changes — only the session is dead.
 
-6. **PID lockfile** to prevent two instances racing on the same config dir. `fs4::FileExt`
-   advisory lock is sufficient.
+5. **PID lockfile** to prevent two instances racing on the same config dir. `fs4::FileExt`
+   advisory lock is sufficient. (`fs4` is the maintained fork of the deprecated `fs2` —
+   crates.io search still surfaces `fs2` first; don't pick that one.)
 
-7. **Device verification is a one-time setup**. On first login, auto-bootstrap cross-signing
+6. **Device verification is a one-time setup**. On first login, auto-bootstrap cross-signing
    and auto-enable key backup. Tell the user "enter your recovery key" once, then never
    again.
 
-8. **Crypto store corruption is not the user's fault.** Detect it by error string
+7. **Crypto store corruption is not the user's fault.** Detect it by error string
    (`"deserialize"` + `"RoomInfo"`/`"sqlite"`), back it up (don't delete), tell the user
    to re-auth.
 
@@ -205,23 +227,34 @@ Client::builder()
     .build()
     .await?;
 
-// After restore_session:
+// After restore_session — clone `path` / `base_config` into each closure separately,
+// otherwise the first closure moves them and the second won't compile.
 client.set_session_callbacks(
-    Box::new(move |_client| {
-        // Reload session from disk.
-        // Note: NOT called for matrix-auth refresh (only OAuth cross-process).
-        // Keep it correct anyway.
-        let cfg = Config::load(&path)?;
-        Ok(SessionTokens { access_token: cfg.access_token, refresh_token: cfg.refresh_token })
+    Box::new({
+        let path = path.clone();
+        move |_client| {
+            // Reload session from disk.
+            // Note: NOT called for matrix-auth refresh (only OAuth cross-process).
+            // Keep it correct anyway.
+            let cfg = Config::load(&path)?;
+            Ok(SessionTokens {
+                access_token: cfg.access_token,
+                refresh_token: cfg.refresh_token, // Option<String>
+            })
+        }
     }),
-    Box::new(move |client| {
-        // Persist refreshed tokens to disk. CALLED BY SDK after refresh.
-        let tokens = client.session_tokens().ok_or("no tokens")?;
-        let mut cfg = base_config.clone();
-        cfg.access_token = tokens.access_token;
-        cfg.refresh_token = tokens.refresh_token;
-        cfg.save(&path)?;
-        Ok(())
+    Box::new({
+        let path = path.clone();
+        let base_config = base_config.clone();
+        move |client| {
+            // Persist refreshed tokens to disk. CALLED BY SDK after refresh.
+            let tokens = client.session_tokens().ok_or("no tokens")?;
+            let mut cfg = base_config.clone();
+            cfg.access_token = tokens.access_token;
+            cfg.refresh_token = tokens.refresh_token;
+            cfg.save(&path)?;
+            Ok(())
+        }
     }),
 )?;
 ```
@@ -264,23 +297,44 @@ loop {
 }
 ```
 
+## Other traps worth knowing
+
+- **Push rules for bot @-mentions.** Bots that only want to respond to direct mentions
+  should filter on `m.push_rules` (override rules `.m.rule.contains_user_name` /
+  `.m.rule.contains_display_name`) rather than substring-matching the body. Intentional
+  mentions (`m.mentions` in event content, MSC3952) are the modern path — prefer those when
+  the server supports them.
+- **Never add `ruma` as a direct dep.** Always use `matrix_sdk::ruma` re-exports. Pulling
+  `ruma` directly pins a different version than the SDK expects and produces
+  "expected `ruma::X`, found `ruma::X`" type errors that look identical but are two
+  different types.
+- **OAuth redirect URIs for local apps.** MAS device-code flow works everywhere. The
+  auth-code flow needs a redirect URI the browser can reach — for CLI / bot apps, bind a
+  local HTTP listener on `http://127.0.0.1:<port>/callback` and register that exact URI
+  with MAS. `http://localhost` sometimes fails where `127.0.0.1` succeeds, depending on
+  MAS client config.
+
 ## Debugging checklist for new Matrix issues
 
-1. What's the server? (Synapse, Dendrite, Conduit, MAS-fronted?)
-2. What's the auth? (legacy /login, MAS device-code, MAS auth-code)
-3. Access token TTL — check `expires_in` in token response
-4. Refresh token behavior — single-use? check token endpoint response
-5. How many `Client` instances? (grep for `Client::builder`, `restore_session`)
-6. How many processes touch the same config/crypto store?
-7. Is the crypto store writable and uncorrupted?
-8. Are `required_state` hints set for sliding sync?
-9. Is E2EE bootstrapped (`recover()` called)?
-10. Does the server advertise `simplified_msc3575` in unstable_features?
+1. What's the SDK version? (`matrix-rust-sdk` moves fast — pin it in any bug report.)
+2. What's the server? (Synapse, Dendrite, Conduit, MAS-fronted?)
+3. What's the auth? (legacy /login, MAS device-code, MAS auth-code)
+4. Access token TTL — check `expires_in` in token response
+5. Refresh token behavior — single-use? check token endpoint response
+6. How many `Client` instances? (grep for `Client::builder`, `restore_session`)
+7. How many processes touch the same config/crypto store?
+8. Is the crypto store writable and uncorrupted?
+9. Are `required_state` hints set for sliding sync?
+10. Is E2EE bootstrapped (`recover()` called)? Is `EncryptionSyncService` running?
+11. Does the server advertise `org.matrix.simplified_msc3575` in `unstable_features`?
 
 ## References
 
 - matrix-rust-sdk source: https://github.com/matrix-org/matrix-rust-sdk
-- Sliding sync spec: MSC4186 (simplified sliding sync)
+- MSC4186 — Simplified Sliding Sync: https://github.com/matrix-org/matrix-spec-proposals/pull/4186
+- MSC3575 — Sliding Sync (original): https://github.com/matrix-org/matrix-spec-proposals/pull/3575
+- MSC2965 — OIDC discovery: https://github.com/matrix-org/matrix-spec-proposals/pull/2965
+- MSC3952 — Intentional mentions: https://github.com/matrix-org/matrix-spec-proposals/pull/3952
+- MSC4291 — Room v12 (create event as room ID): https://github.com/matrix-org/matrix-spec-proposals/pull/4291
 - MAS: https://github.com/element-hq/matrix-authentication-service
 - Matrix E2EE spec: https://spec.matrix.org/latest/client-server-api/#end-to-end-encryption
-- Room version 12: MSC4291

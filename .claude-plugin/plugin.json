@@ -1,6 +1,6 @@
 {
   "name": "matrix-expert",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Expert guidance on Matrix protocol, matrix-rust-sdk, E2EE, MAS OAuth, sliding sync, and bot/client architecture.",
   "author": {
     "name": "Minagawa",
